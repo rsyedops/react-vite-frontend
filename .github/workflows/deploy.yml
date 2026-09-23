@@ -1,0 +1,175 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+  NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Vite 2 cannot load its configuration on Node 18 or newer, so the toolchain
+      # is pinned here exactly as it is in the Dockerfile build stage.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 16.20.2
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npx eslint src --ext .js,.jsx
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_URL: /api
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=critical
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      # Required for the OIDC token exchanged for AWS credentials.
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The API path is baked in at build time; "/api" keeps the image
+      # environment-agnostic and lets the ingress decide the backend.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          build-args: VITE_API_URL=/api
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push image
+        run: docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INFRASTRUCTURE_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.INFRASTRUCTURE_TOKEN }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # GitHub-hosted runners ship kustomize, and the upstream installer refuses
+      # to overwrite an existing binary, so it only runs when nothing is there.
+      - name: Install kustomize
+        run: |
+          if ! command -v kustomize >/dev/null 2>&1; then
+            curl -fsSL https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh \
+              | bash -s 5.5.0 /usr/local/bin
+          fi
+          kustomize version
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
+
+      - name: Render environment values
+        working-directory: kubernetes
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: ./render.sh
+
+      - name: Pin image tag
+        working-directory: kubernetes/overlays/dev
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}"
+          kustomize edit set image "frontend=${IMAGE}:${{ needs.build.outputs.image_tag }}"
+
+      # Only the objects this application owns. Everything shared, and the
+      # backend's own objects, are managed by the backend pipeline.
+      - name: Apply manifests
+        run: |
+          kustomize build kubernetes/overlays/dev \
+            | kubectl -n "$NAMESPACE" apply --selector app.kubernetes.io/name=frontend -f -
+
+      - name: Wait for rollout
+        run: kubectl -n "$NAMESPACE" rollout status deployment/frontend --timeout=10m
+
+      # The load balancer hostname only appears on the Ingress once the controller
+      # has created the ALB, so it is looked up on every attempt rather than once.
+      - name: Smoke test
+        run: |
+          for attempt in $(seq 1 30); do
+            HOST=$(kubectl -n "$NAMESPACE" get ingress conduit \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$HOST" ]; then
+              echo "attempt ${attempt}: load balancer hostname not assigned yet"
+              sleep 20
+              continue
+            fi
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://${HOST}/" || true)
+            if [ "$code" = "200" ]; then
+              echo "SPA served at http://${HOST}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: got ${code} from http://${HOST}/"
+            sleep 20
+          done
+          echo "smoke test failed"
+          kubectl -n "$NAMESPACE" rollout undo deployment/frontend
+          exit 1

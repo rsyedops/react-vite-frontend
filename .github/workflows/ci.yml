@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Vite 2 cannot load its configuration on Node 18 or newer, so the toolchain
+      # is pinned here exactly as it is in the Dockerfile build stage.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 16.20.2
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npx eslint src --ext .js,.jsx
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_URL: /api
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=critical

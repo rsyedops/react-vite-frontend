@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+dist
+cypress
+cypress.json
+.env
+.env.*
+!.env.example
+*.log
+readme.md
+logo.png
+Dockerfile
+.dockerignore
